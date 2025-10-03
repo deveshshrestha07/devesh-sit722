@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]
     types: [completed]
+  workflow_dispatch: {}   # optional manual trigger
 
 permissions:
   contents: read
@@ -16,14 +17,13 @@ env:
   RG_PREFIX: sit722-staging
 
 concurrency:
-  group: stage2-${{ github.ref }}
+  group: stage2-${{ github.event.workflow_run.head_branch || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   deploy-staging:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing') }}
     runs-on: ubuntu-latest
-
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -41,7 +41,7 @@ jobs:
         id: vars
         shell: bash
         run: |
-          IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          IMAGE_TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
           RG="${{ env.RG_PREFIX }}-${{ github.run_id }}"
           ENV_NAME="aca-${{ github.run_id }}"
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
@@ -60,10 +60,7 @@ jobs:
         id: la
         run: |
           LA_NAME="la-${{ github.run_id }}"
-          az monitor log-analytics workspace create \
-            -g "${{ steps.vars.outputs.RG }}" \
-            -n "$LA_NAME" \
-            -l "${{ env.LOCATION }}" >/dev/null
+          az monitor log-analytics workspace create -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" -l "${{ env.LOCATION }}" >/dev/null
           LA_ID=$(az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query id -o tsv)
           LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv)
           echo "id=$LA_ID"  >> "$GITHUB_OUTPUT"
@@ -84,16 +81,8 @@ jobs:
         run: |
           ACR_ID=$(az acr show -n "${{ env.ACR_NAME }}" --query id -o tsv)
           ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "${{ steps.vars.outputs.RG }}" -n "${{ steps.vars.outputs.ENV_NAME }}" --query identity.principalId -o tsv)
-          az role assignment create \
-            --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
-            --assignee-principal-type ServicePrincipal \
-            --role AcrPull \
-            --scope "$ACR_ID"
-          az containerapp registry set \
-            -g "${{ steps.vars.outputs.RG }}" \
-            --environment "${{ steps.vars.outputs.ENV_NAME }}" \
-            --server "${{ env.ACR_LOGIN_SERVER }}" \
-            --identity system
+          az role assignment create --assignee-object-id "$ENV_MI_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID"
+          az containerapp registry set -g "${{ steps.vars.outputs.RG }}" --environment "${{ steps.vars.outputs.ENV_NAME }}" --server "${{ env.ACR_LOGIN_SERVER }}" --identity system
 
       - name: Deploy services
         id: deploy
@@ -139,7 +128,7 @@ jobs:
           set -e
           echo "Waiting for apps to warm up..."
           sleep 30
-          curl -fsS "${{ steps.deploy.outputs.FRONTEND_URL }}" >/dev/null || (echo "frontend not ready"; exit 1)
+          curl -fsS "${{ steps.deploy.outputs.FRONTEND_URL }}" >/dev/null
           curl -fsS "${{ steps.deploy.outputs.CUSTOMER_URL }}/health" || true
           curl -fsS "${{ steps.deploy.outputs.PRODUCT_URL }}/health" || true
           curl -fsS "${{ steps.deploy.outputs.ORDER_URL }}/health"   || true
