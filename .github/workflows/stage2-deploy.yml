@@ -10,10 +10,14 @@ permissions:
   id-token: write
 
 env:
+  # ======= CONFIG =======
   LOCATION: australiaeast
-  RG_PREFIX: sit722-staging
+  # Use a FIXED RG if you granted Contributor at RG scope; otherwise leave RG_NAME empty to create per-run RGs.
+  RG_NAME: sit722-staging-fixed         # <-- set to "" to create per-run RGs
+  RG_PREFIX: sit722-staging             # used only if RG_NAME is empty
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  # =======================
 
 concurrency:
   group: stage2-${{ github.ref }}
@@ -21,9 +25,9 @@ concurrency:
 
 jobs:
   deploy-staging:
-    # Only run if Stage 1 succeeded and it ran for 'testing' branch
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -36,6 +40,12 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Verify subscription & CLI
+        run: |
+          set -e
+          az account show -o table
+          az --version
+
       - name: Install Azure CLI extensions
         run: |
           set -e
@@ -45,18 +55,30 @@ jobs:
       - name: Compute variables
         id: vars
         run: |
-          echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-          echo "RG=${{ env.RG_PREFIX }}-${{ github.run_id }}"       >> "$GITHUB_OUTPUT"
-          echo "ENV_NAME=aca-${{ github.run_id }}"                   >> "$GITHUB_OUTPUT"
+          IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          if [ -n "${{ env.RG_NAME }}" ]; then
+            RG="${{ env.RG_NAME }}"
+          else
+            RG="${{ env.RG_PREFIX }}-${{ github.run_id }}"
+          fi
+          ENV_NAME="aca-${{ github.run_id }}"
+          {
+            echo "IMAGE_TAG=${IMAGE_TAG}"
+            echo "RG=${RG}"
+            echo "ENV_NAME=${ENV_NAME}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Create resource group
+      - name: Ensure resource group exists
         run: |
           az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
 
-      - name: Ensure providers registered
+      - name: Ensure providers registered (with waits)
         run: |
-          az provider register --namespace Microsoft.App --wait
-          az provider register --namespace Microsoft.OperationalInsights --wait
+          set -e
+          for P in Microsoft.App Microsoft.OperationalInsights; do
+            echo "Registering provider: $P"
+            az provider register --namespace $P --wait
+          done
 
       - name: Create Log Analytics workspace
         id: la
@@ -67,8 +89,17 @@ jobs:
             -g "${{ steps.vars.outputs.RG }}" \
             -n "$LA_NAME" \
             -l "${{ env.LOCATION }}" >/dev/null
-          LA_ID=$(az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query id -o tsv)
-          LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv)
+
+          # fetch id/key (may take a few seconds to become available)
+          for i in {1..10}; do
+            LA_ID=$(az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query id -o tsv 2>/dev/null || true)
+            LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv 2>/dev/null || true)
+            if [ -n "$LA_ID" ] && [ -n "$LA_KEY" ]; then break; fi
+            echo "Waiting for Log Analytics props... ($i/10)"; sleep 6
+          done
+          if [ -z "$LA_ID" ] || [ -z "$LA_KEY" ]; then
+            echo "Failed to get LA workspace id/key"; exit 1
+          fi
           echo "id=$LA_ID"  >> "$GITHUB_OUTPUT"
           echo "key=$LA_KEY" >> "$GITHUB_OUTPUT"
 
@@ -82,20 +113,22 @@ jobs:
             --logs-workspace-key "${{ steps.la.outputs.key }}" \
             --assign-identity
 
-      - name: Grant env identity ACR Pull & set registry
+      - name: Grant env identity ACR Pull & set registry (with retry)
         run: |
           set -e
           ACR_ID=$(az acr show -n "${{ env.ACR_NAME }}" --query id -o tsv)
           ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "${{ steps.vars.outputs.RG }}" -n "${{ steps.vars.outputs.ENV_NAME }}" --query identity.principalId -o tsv)
 
-          # Give the env MI AcrPull on your ACR
-          az role assignment create \
-            --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
-            --assignee-principal-type ServicePrincipal \
-            --role AcrPull \
-            --scope "$ACR_ID"
+          # RBAC can be eventually consistent; retry a few times
+          for i in {1..6}; do
+            az role assignment create \
+              --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
+              --assignee-principal-type ServicePrincipal \
+              --role AcrPull \
+              --scope "$ACR_ID" && break || true
+            echo "Retrying AcrPull assignment... ($i/6)"; sleep 10
+          done
 
-          # Configure the registry on the environment using system identity
           az containerapp registry set \
             -g "${{ steps.vars.outputs.RG }}" \
             --environment "${{ steps.vars.outputs.ENV_NAME }}" \
@@ -110,20 +143,21 @@ jobs:
           RG="${{ steps.vars.outputs.RG }}"
           ENV_NAME="${{ steps.vars.outputs.ENV_NAME }}"
 
-          # helper to create or update
           upsert_app () {
             local NAME=$1
             local PORT=$2
             local IMAGE=$3
-            local EXTRA_ARGS=${4:-}
+            shift 3
+            local EXTRA_ARGS=("$@")
+
             if az containerapp show -g "$RG" -n "$NAME" >/dev/null 2>&1; then
-              az containerapp update -g "$RG" -n "$NAME" --image "$IMAGE" $EXTRA_ARGS
+              az containerapp update -g "$RG" -n "$NAME" --image "$IMAGE" "${EXTRA_ARGS[@]}"
             else
               az containerapp create -g "$RG" -n "$NAME" \
                 --environment "$ENV_NAME" \
                 --image "$IMAGE" \
                 --ingress external --target-port "$PORT" --transport auto \
-                $EXTRA_ARGS
+                "${EXTRA_ARGS[@]}"
             fi
           }
 
@@ -133,17 +167,18 @@ jobs:
           upsert_app "product-service"  8003 "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}"
           PRODUCT_FQDN=$(az containerapp show -g "$RG" -n product-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # order-service needs CUSTOMER_SERVICE_URL
-          upsert_app "order-service"    8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
+          upsert_app "order-service"    8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" --env-vars CUSTOMER_SERVICE_URL="http://${CUSTOMER_FQDN}"
           ORDER_FQDN=$(az containerapp show -g "$RG" -n order-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
           upsert_app "frontend"            80 "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}"
           FRONTEND_FQDN=$(az containerapp show -g "$RG" -n frontend --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"  >> "$GITHUB_OUTPUT"
-          echo "PRODUCT_URL=http://${PRODUCT_FQDN}"    >> "$GITHUB_OUTPUT"
-          echo "ORDER_URL=http://${ORDER_FQDN}"        >> "$GITHUB_OUTPUT"
-          echo "FRONTEND_URL=http://${FRONTEND_FQDN}"  >> "$GITHUB_OUTPUT"
+          {
+            echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"
+            echo "PRODUCT_URL=http://${PRODUCT_FQDN}"
+            echo "ORDER_URL=http://${ORDER_FQDN}"
+            echo "FRONTEND_URL=http://${FRONTEND_FQDN}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Smoke test (light)
         run: |
@@ -159,7 +194,6 @@ jobs:
         run: |
           echo "${{ steps.vars.outputs.RG }}"       > staging-rg.txt
           echo "${{ steps.vars.outputs.ENV_NAME }}" > staging-env.txt
-
       - uses: actions/upload-artifact@v4
         with:
           name: staging-info
