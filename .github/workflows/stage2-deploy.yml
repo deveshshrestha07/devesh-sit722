@@ -2,7 +2,7 @@ name: Stage 2 - Provision Staging & Deploy
 
 on:
   workflow_run:
-    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]
+    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]  # must exactly match Stage 1 name
     types: [completed]
 
 permissions:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   deploy-staging:
-    # Only run if Stage 1 succeeded and ran for 'testing' branch
+    # only run if Stage 1 succeeded AND was for the 'testing' branch
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
 
@@ -33,17 +33,14 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install/upgrade Azure CLI extensions
+      - name: Install Azure CLI extensions
         run: |
           set -e
           az extension add --name containerapp --upgrade -y
           az extension add --name log-analytics --upgrade -y || true
-          az version
-          az extension list -o table
 
       - name: Compute variables
         id: vars
-        shell: bash
         run: |
           echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
           echo "RG=${{ env.RG_PREFIX }}-${{ github.run_id }}"       >> "$GITHUB_OUTPUT"
@@ -69,10 +66,10 @@ jobs:
             -l "${{ env.LOCATION }}" >/dev/null
           LA_ID=$(az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query id -o tsv)
           LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv)
-          echo "id=$LA_ID"   >> "$GITHUB_OUTPUT"
+          echo "id=$LA_ID"  >> "$GITHUB_OUTPUT"
           echo "key=$LA_KEY" >> "$GITHUB_OUTPUT"
 
-      # --- FIX: create env WITHOUT --assign-identity, then assign identity in next step ---
+      # ✅ no --assign-identity here
       - name: Create Container Apps environment
         run: |
           az containerapp env create \
@@ -82,6 +79,7 @@ jobs:
             --logs-workspace-id  "${{ steps.la.outputs.id }}" \
             --logs-workspace-key "${{ steps.la.outputs.key }}"
 
+      # ✅ assign identity in a separate step
       - name: Assign system identity to env
         run: |
           az containerapp env identity assign \
@@ -93,19 +91,14 @@ jobs:
         run: |
           set -e
           ACR_ID=$(az acr show -n "${{ env.ACR_NAME }}" --query id -o tsv)
-          ENV_MI_PRINCIPAL_ID=$(az containerapp env show \
-            -g "${{ steps.vars.outputs.RG }}" \
-            -n "${{ steps.vars.outputs.ENV_NAME }}" \
-            --query identity.principalId -o tsv)
+          ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "${{ steps.vars.outputs.RG }}" -n "${{ steps.vars.outputs.ENV_NAME }}" --query identity.principalId -o tsv)
 
-          # Give the env MI AcrPull on your ACR
           az role assignment create \
             --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
             --assignee-principal-type ServicePrincipal \
             --role AcrPull \
             --scope "$ACR_ID"
 
-          # Configure the registry on the environment using system identity
           az containerapp registry set \
             -g "${{ steps.vars.outputs.RG }}" \
             --environment "${{ steps.vars.outputs.ENV_NAME }}" \
@@ -114,7 +107,6 @@ jobs:
 
       - name: Deploy/Update services (Container Apps)
         id: deploy
-        shell: bash
         run: |
           set -e
           IMAGE_TAG="${{ steps.vars.outputs.IMAGE_TAG }}"
@@ -125,7 +117,8 @@ jobs:
             local NAME=$1
             local PORT=$2
             local IMAGE=$3
-            local EXTRA_ARGS=${4:-}
+            shift 3
+            local EXTRA_ARGS="$@"
             if az containerapp show -g "$RG" -n "$NAME" >/dev/null 2>&1; then
               az containerapp update -g "$RG" -n "$NAME" --image "$IMAGE" $EXTRA_ARGS
             else
@@ -137,20 +130,16 @@ jobs:
             fi
           }
 
-          # customer-service (8002)
           upsert_app "customer-service" 8002 "${{ env.ACR_LOGIN_SERVER }}/customer-service:${IMAGE_TAG}"
           CUSTOMER_FQDN=$(az containerapp show -g "$RG" -n customer-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # product-service (8003)
-          upsert_app "product-service" 8003 "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}"
+          upsert_app "product-service"  8003 "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}"
           PRODUCT_FQDN=$(az containerapp show -g "$RG" -n product-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # order-service (8001) — needs CUSTOMER_SERVICE_URL
-          upsert_app "order-service" 8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
+          upsert_app "order-service"    8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" --env-vars CUSTOMER_SERVICE_URL="http://${CUSTOMER_FQDN}"
           ORDER_FQDN=$(az containerapp show -g "$RG" -n order-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # frontend (80)
-          upsert_app "frontend" 80 "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}"
+          upsert_app "frontend"            80 "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}"
           FRONTEND_FQDN=$(az containerapp show -g "$RG" -n frontend --query "properties.configuration.ingress.fqdn" -o tsv)
 
           echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"  >> "$GITHUB_OUTPUT"
@@ -172,7 +161,6 @@ jobs:
         run: |
           echo "${{ steps.vars.outputs.RG }}"       > staging-rg.txt
           echo "${{ steps.vars.outputs.ENV_NAME }}" > staging-env.txt
-
       - uses: actions/upload-artifact@v4
         with:
           name: staging-info
