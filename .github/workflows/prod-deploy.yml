@@ -2,7 +2,7 @@ name: Stage 3 - Deploy to Production (upsert)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -10,24 +10,22 @@ permissions:
   id-token: write
 
 env:
-  # ACR
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
 
-  # Existing production infra (Container Apps Environment)
-  PROD_RG: ${{ secrets.PROD_RG }}                 # e.g. sit722-staging-18219002541
-  PROD_ENV_NAME: ${{ secrets.PROD_ENV_NAME }}     # e.g. aca-18219002541
+  # Prod infra (already created once)
+  PROD_RG: ${{ secrets.PROD_RG }}
+  PROD_ENV_NAME: ${{ secrets.PROD_ENV_NAME }}
 
-  # App names (defaults; change here or fork this file if prod names differ)
-  CUSTOMER_APP: customer-service
-  PRODUCT_APP:  product-service
-  ORDER_APP:    order-service
-  FRONTEND_APP: frontend
+  # App names (override via repo secrets if you use different names in prod)
+  CUSTOMER_APP: ${{ secrets.PROD_CUSTOMER_APP || 'customer-service' }}
+  PRODUCT_APP:  ${{ secrets.PROD_PRODUCT_APP  || 'product-service'  }}
+  ORDER_APP:    ${{ secrets.PROD_ORDER_APP    || 'order-service'    }}
+  FRONTEND_APP: ${{ secrets.PROD_FRONTEND_APP || 'frontend'         }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -39,66 +37,70 @@ jobs:
       - name: Install Container Apps extension
         run: az extension add --name containerapp --upgrade -y
 
-      - name: Compute image tag (commit SHA)
-        id: vars
-        run: echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Normalize prod inputs (trim whitespace)
+        id: norm
+        run: |
+          RG_TRIM=$(printf "%s" "$PROD_RG" | tr -d '[:space:]')
+          ENV_TRIM=$(printf "%s" "$PROD_ENV_NAME" | tr -d '[:space:]')
+          echo "PROD_RG=$RG_TRIM" >> "$GITHUB_ENV"
+          echo "PROD_ENV_NAME=$ENV_TRIM" >> "$GITHUB_ENV"
+          echo "Using PROD_RG='$RG_TRIM' PROD_ENV_NAME='$ENV_TRIM'"
 
       - name: Verify Container Apps environment exists
         run: |
           set -e
+          az containerapp env list -g "$PROD_RG" -o table || true
           if ! az containerapp env show -g "$PROD_RG" -n "$PROD_ENV_NAME" >/dev/null 2>&1; then
-            echo "::error::Container Apps environment '$PROD_ENV_NAME' not found in RG '$PROD_RG'. Create it once and re-run."
+            echo "::error::Container Apps environment '$PROD_ENV_NAME' not found in RG '$PROD_RG'."
+            echo "Create it once (Portal/CLI) or fix the secret values."
             exit 1
           fi
 
-      - name: Ensure env identity can pull from ACR (idempotent)
+      - name: Compute image tag
+        id: vars
+        run: echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure env can pull from ACR (idempotent)
         run: |
           set -e
           ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "$PROD_RG" -n "$PROD_ENV_NAME" --query identity.principalId -o tsv || true)
           if [ -n "$ENV_MI_PRINCIPAL_ID" ]; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
-            # grant AcrPull to the env identity on the ACR (safe if it already exists)
             az role assignment create \
               --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
               --assignee-principal-type ServicePrincipal \
               --role AcrPull \
               --scope "$ACR_ID" >/dev/null 2>&1 || true
-          else
-            echo "::warning::No system identity on the Container Apps environment; pulling from ACR may fail."
+
+            # Newer CLI supports registry on the env; noop if already set
+            az containerapp registry set \
+              -g "$PROD_RG" \
+              --environment "$PROD_ENV_NAME" \
+              --server "$ACR_LOGIN_SERVER" \
+              --identity system >/dev/null 2>&1 || true
           fi
 
-      - name: Upsert apps in production (create if missing, else update)
+      - name: Upsert apps in production
         id: upsert
         env:
           IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
-        shell: bash
         run: |
-          set -euo pipefail
-
+          set -e
           IMG_CUSTOMER="${ACR_LOGIN_SERVER}/customer-service:${IMAGE_TAG}"
           IMG_PRODUCT="${ACR_LOGIN_SERVER}/product-service:${IMAGE_TAG}"
           IMG_ORDER="${ACR_LOGIN_SERVER}/order-service:${IMAGE_TAG}"
           IMG_FRONTEND="${ACR_LOGIN_SERVER}/frontend:${IMAGE_TAG}"
 
           upsert () {
-            local NAME="$1" PORT="$2" IMAGE="$3" EXTRA="${4:-}"
-
+            local NAME=$1 PORT=$2 IMAGE=$3 EXTRA_ARGS=${4:-}
             if az containerapp show -g "$PROD_RG" -n "$NAME" >/dev/null 2>&1; then
-              echo "↻ Updating $NAME"
-              az containerapp update -g "$PROD_RG" -n "$NAME" \
-                --image "$IMAGE" \
-                --registry-server "$ACR_LOGIN_SERVER" \
-                --registry-identity system \
-                $EXTRA
+              az containerapp update -g "$PROD_RG" -n "$NAME" --image "$IMAGE" $EXTRA_ARGS
             else
-              echo "➕ Creating $NAME"
               az containerapp create -g "$PROD_RG" -n "$NAME" \
                 --environment "$PROD_ENV_NAME" \
                 --image "$IMAGE" \
                 --ingress external --target-port "$PORT" --transport auto \
-                --registry-server "$ACR_LOGIN_SERVER" \
-                --registry-identity system \
-                $EXTRA
+                $EXTRA_ARGS
             fi
           }
 
