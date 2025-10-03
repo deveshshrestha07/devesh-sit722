@@ -11,7 +11,13 @@ permissions:
 
 env:
   LOCATION: australiaeast
+
+  # Use an existing RG if you don't have rights to create new ones.
+  # Set RG_NAME to your pre-created group (e.g., sit722-staging-fixed).
+  # Leave RG_NAME blank to let the workflow create a temporary RG.
+  RG_NAME: sit722-staging-fixed
   RG_PREFIX: sit722-staging
+
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
 
@@ -45,41 +51,69 @@ jobs:
       - name: Compute variables
         id: vars
         run: |
-          echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-          echo "RG=${{ env.RG_PREFIX }}-${{ github.run_id }}"       >> "$GITHUB_OUTPUT"
-          echo "ENV_NAME=aca-${{ github.run_id }}"                   >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
 
-      - name: Create resource group
+          # If RG_NAME is provided, use it; else synthesize a temp RG name.
+          if [[ -n "${RG_NAME:-}" ]]; then
+            RG="$RG_NAME"
+          else
+            RG="${RG_PREFIX}-${GITHUB_RUN_ID}"
+          fi
+
+          ENV_NAME="aca-${GITHUB_RUN_ID}"
+
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "RG=$RG"               >> "$GITHUB_OUTPUT"
+          echo "ENV_NAME=$ENV_NAME"   >> "$GITHUB_OUTPUT"
+
+      - name: Ensure resource group exists (no-op if pre-created)
         run: |
-          az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
+          set -e
+          if az group show -n "${{ steps.vars.outputs.RG }}" >/dev/null 2>&1; then
+            echo "RG exists: ${{ steps.vars.outputs.RG }}"
+          else
+            echo "Creating RG: ${{ steps.vars.outputs.RG }}"
+            az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
+          fi
 
       - name: Ensure providers registered
         run: |
           az provider register --namespace Microsoft.App --wait
           az provider register --namespace Microsoft.OperationalInsights --wait
 
-      # ---------- LOG ANALYTICS (FIX: use customerId, not resource id) ----------
-      - name: Create Log Analytics workspace
+      # ---------- LOG ANALYTICS (sanitize GUID) ----------
+      - name: Create/resolve Log Analytics workspace
         id: la
         run: |
-          set -e
-          LA_NAME="la-${{ github.run_id }}"
+          set -euo pipefail
+          LA_NAME="la-${GITHUB_RUN_ID}"
+
           if ! az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" >/dev/null 2>&1; then
             az monitor log-analytics workspace create \
               -g "${{ steps.vars.outputs.RG }}" \
               -n "$LA_NAME" \
               -l "${{ env.LOCATION }}" >/dev/null
           fi
+
           LA_CUSTOMER_ID=$(az monitor log-analytics workspace show \
-            -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query customerId -o tsv)
+            -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query customerId -o tsv | tr -d '[:space:]')
           LA_KEY=$(az monitor log-analytics workspace get-shared-keys \
-            -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv)
+            -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv | tr -d '[:space:]')
+
+          # Validate: must look like a 36-char GUID
+          if ! [[ "$LA_CUSTOMER_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "Bad Log Analytics customerId: '$LA_CUSTOMER_ID'" >&2
+            exit 1
+          fi
+
           echo "customerId=$LA_CUSTOMER_ID" >> "$GITHUB_OUTPUT"
           echo "key=$LA_KEY"               >> "$GITHUB_OUTPUT"
 
       # ---------- CONTAINER APPS ENV ----------
       - name: Create Container Apps environment
         run: |
+          set -e
           az containerapp env create \
             -g "${{ steps.vars.outputs.RG }}" \
             -n "${{ steps.vars.outputs.ENV_NAME }}" \
@@ -87,9 +121,10 @@ jobs:
             --logs-workspace-id  "${{ steps.la.outputs.customerId }}" \
             --logs-workspace-key "${{ steps.la.outputs.key }}"
 
-      # Assign a system-assigned identity to the env (replacement for deprecated flags)
+      # Assign a system-assigned identity to the env (separate command)
       - name: Assign system identity to env
         run: |
+          set -e
           az containerapp env identity assign \
             -g "${{ steps.vars.outputs.RG }}" \
             -n "${{ steps.vars.outputs.ENV_NAME }}" \
@@ -98,7 +133,7 @@ jobs:
       # ---------- REGISTRY PULL (ACR) ----------
       - name: Grant env identity ACR Pull & set registry
         run: |
-          set -e
+          set -euo pipefail
           ACR_ID=$(az acr show -n "${{ env.ACR_NAME }}" --query id -o tsv)
           ENV_MI_PRINCIPAL_ID=$(az containerapp env show \
             -g "${{ steps.vars.outputs.RG }}" \
@@ -123,7 +158,7 @@ jobs:
       - name: Deploy/Update services (Container Apps)
         id: deploy
         run: |
-          set -e
+          set -euo pipefail
           IMAGE_TAG="${{ steps.vars.outputs.IMAGE_TAG }}"
           RG="${{ steps.vars.outputs.RG }}"
           ENV_NAME="${{ steps.vars.outputs.ENV_NAME }}"
