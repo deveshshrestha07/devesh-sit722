@@ -1,4 +1,4 @@
-name: Stage 2 - Provision Staging & Deploy (No Logs, Works)
+name: Stage 2 - Provision Staging & Deploy (No-Logs ARM)
 
 on:
   workflow_run:
@@ -10,9 +10,9 @@ permissions:
   id-token: write
 
 env:
-  # deploy into the fixed RG you already granted Contributor to
-  STAGING_RG: sit722-staging-fixed
   LOCATION: australiaeast
+  # fixed RG you already granted Contributor on:
+  STAGING_RG: sit722-staging-fixed
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
 
@@ -24,6 +24,9 @@ jobs:
   deploy-staging:
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Azure login (OIDC)
@@ -36,58 +39,68 @@ jobs:
       - name: Install Azure CLI extensions
         run: |
           set -e
-          az extension add --name containerapp --upgrade -y
+          az extension add --name containerapp --upgrade -y || true
 
       - name: Compute variables
         id: vars
-        shell: bash
         run: |
           echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
           echo "ENV_NAME=aca-${{ github.run_id }}"                   >> "$GITHUB_OUTPUT"
 
       - name: Ensure resource group exists
-        run: |
-          az group create -n "${{ env.STAGING_RG }}" -l "${{ env.LOCATION }}"
+        run: az group create -n "${{ env.STAGING_RG }}" -l "${{ env.LOCATION }}"
 
-      # ⛔ EXPLICITLY DISABLE LOG ANALYTICS
-      - name: Create Container Apps environment (no logs)
+      # ---- CREATE CONTAINER APPS ENV VIA ARM (NO LOGS) ----
+      - name: Create Container Apps Environment (no logs, ARM)
         run: |
-          if ! az containerapp env show -g "${{ env.STAGING_RG }}" -n "${{ steps.vars.outputs.ENV_NAME }}" >/dev/null 2>&1; then
-            az containerapp env create \
-              -g "${{ env.STAGING_RG }}" \
-              -n "${{ steps.vars.outputs.ENV_NAME }}" \
-              -l "${{ env.LOCATION }}" \
-              --logs-destination none
-          else
-            echo "Env exists: ${{ steps.vars.outputs.ENV_NAME }}"
-          fi
+          set -e
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          RG="${{ env.STAGING_RG }}"
+          ENV_NAME="${{ steps.vars.outputs.ENV_NAME }}"
+          LOCATION="${{ env.LOCATION }}"
+          API="2023-05-01"
 
-      # Get ACR credentials (or fallback to repo secrets ACR_USERNAME/ACR_PASSWORD)
+          # idempotent PUT to create/update env with logs disabled
+          az rest \
+            --method PUT \
+            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.App/managedEnvironments/${ENV_NAME}?api-version=${API}" \
+            --body "{
+              \"location\": \"${LOCATION}\",
+              \"properties\": {
+                \"appLogsConfiguration\": { \"destination\": \"none\" }
+              }
+            }" \
+            --output none
+
+          # small wait until ready state to avoid races
+          az containerapp env show -g "$RG" -n "$ENV_NAME" --query "provisioningState" -o tsv
+
+      # ---- PULL CREDS FOR ACR (username/password) ----
+      # Works with ACR Admin enabled OR fallback to repo secrets ACR_USERNAME/ACR_PASSWORD
       - name: Resolve ACR credentials
         id: acr
-        shell: bash
         run: |
           set -e
           USERNAME=""
           PASSWORD=""
           if az acr show -n "${{ env.ACR_NAME }}" >/dev/null 2>&1; then
-            USERNAME=$(az acr credential show -n "${{ env.ACR_NAME }}" --query "username" -o tsv)
-            PASSWORD=$(az acr credential show -n "${{ env.ACR_NAME }}" --query "passwords[0].value" -o tsv)
+            USERNAME=$(az acr credential show -n "${{ env.ACR_NAME }}" --query "username" -o tsv || true)
+            PASSWORD=$(az acr credential show -n "${{ env.ACR_NAME }}" --query "passwords[0].value" -o tsv || true)
           fi
           if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
             USERNAME="${{ secrets.ACR_USERNAME }}"
             PASSWORD="${{ secrets.ACR_PASSWORD }}"
           fi
           if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
-            echo "ACR credentials not available. Add ACR_USERNAME and ACR_PASSWORD repo secrets or grant this principal ACR admin."
+            echo "ACR credentials not available. Either enable Admin user on your ACR or set ACR_USERNAME and ACR_PASSWORD repo secrets."
             exit 1
           fi
           echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
           echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
 
+      # ---- DEPLOY APPS ----
       - name: Deploy/Update services (Container Apps)
         id: deploy
-        shell: bash
         run: |
           set -e
           RG="${{ env.STAGING_RG }}"
@@ -139,7 +152,6 @@ jobs:
           echo "FRONTEND_URL=http://${FRONTEND_FQDN}"  >> "$GITHUB_OUTPUT"
 
       - name: Smoke test (light)
-        shell: bash
         run: |
           set -e
           echo "Waiting for apps to warm up..."
