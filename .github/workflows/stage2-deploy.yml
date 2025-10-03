@@ -2,7 +2,7 @@ name: Stage 2 - Provision Staging & Deploy
 
 on:
   workflow_run:
-    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]
+    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]  # must exactly match Stage 1 name
     types: [completed]
 
 permissions:
@@ -21,9 +21,12 @@ concurrency:
 
 jobs:
   deploy-staging:
+    # Only run if Stage 1 succeeded and it ran for 'testing' branch
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
-    defaults: { run: { shell: bash } }
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Azure login (OIDC)
@@ -33,12 +36,11 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install Container Apps extension
+      - name: Install Azure CLI extensions
         run: |
-          az extension add --name containerapp --upgrade -y || az extension update --name containerapp -y
-
-      # (Optional) checkout just to help us verify what's on main
-      - uses: actions/checkout@v4
+          set -e
+          az extension add --name containerapp --upgrade -y
+          az extension add --name log-analytics --upgrade -y || true
 
       - name: Compute variables
         id: vars
@@ -48,18 +50,41 @@ jobs:
           echo "ENV_NAME=aca-${{ github.run_id }}"                   >> "$GITHUB_OUTPUT"
 
       - name: Create resource group
-        run: az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
+        run: |
+          az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
 
       - name: Ensure providers registered
-        run: az provider register --namespace Microsoft.App --wait
+        run: |
+          az provider register --namespace Microsoft.App --wait
+          az provider register --namespace Microsoft.OperationalInsights --wait
 
-      # ✅ No Log Analytics flags here
-      - name: Create Container Apps environment (no LA)
+      # ---------- LOG ANALYTICS (use customerId GUID + primary key) ----------
+      - name: Create Log Analytics workspace
+        id: la
+        run: |
+          set -e
+          LA_NAME="la-${{ github.run_id }}"
+          if ! az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" >/dev/null 2>&1; then
+            az monitor log-analytics workspace create \
+              -g "${{ steps.vars.outputs.RG }}" \
+              -n "$LA_NAME" \
+              -l "${{ env.LOCATION }}" >/dev/null
+          fi
+          LA_CUSTOMER_ID=$(az monitor log-analytics workspace show \
+            -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query customerId -o tsv)
+          LA_KEY=$(az monitor log-analytics workspace get-shared-keys \
+            -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv)
+          echo "customerId=$LA_CUSTOMER_ID" >> "$GITHUB_OUTPUT"
+          echo "key=$LA_KEY"               >> "$GITHUB_OUTPUT"
+
+      - name: Create Container Apps environment
         run: |
           az containerapp env create \
             -g "${{ steps.vars.outputs.RG }}" \
             -n "${{ steps.vars.outputs.ENV_NAME }}" \
-            -l "${{ env.LOCATION }}"
+            -l "${{ env.LOCATION }}" \
+            --logs-workspace-id  "${{ steps.la.outputs.customerId }}" \
+            --logs-workspace-key "${{ steps.la.outputs.key }}"
 
       - name: Assign system identity to env
         run: |
@@ -68,7 +93,8 @@ jobs:
             -n "${{ steps.vars.outputs.ENV_NAME }}" \
             --system-assigned
 
-      - name: Grant env identity ACR Pull & set registry
+      # ---------- REGISTRY PERMISSIONS (no 'registry set' at env level) ----------
+      - name: Grant env identity AcrPull on ACR
         run: |
           set -e
           ACR_ID=$(az acr show -n "${{ env.ACR_NAME }}" --query id -o tsv)
@@ -76,48 +102,66 @@ jobs:
             -g "${{ steps.vars.outputs.RG }}" \
             -n "${{ steps.vars.outputs.ENV_NAME }}" \
             --query identity.principalId -o tsv)
+
           az role assignment create \
             --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
             --assignee-principal-type ServicePrincipal \
             --role AcrPull \
             --scope "$ACR_ID"
-          az containerapp registry set \
-            -g "${{ steps.vars.outputs.RG }}" \
-            --environment "${{ steps.vars.outputs.ENV_NAME }}" \
-            --server "${{ env.ACR_LOGIN_SERVER }}" \
-            --identity system
 
-      - name: Deploy/Update services
+      # ---------- DEPLOY / UPDATE APPS (registry is configured per app) ----------
+      - name: Deploy/Update services (Container Apps)
         id: deploy
         run: |
           set -e
           IMAGE_TAG="${{ steps.vars.outputs.IMAGE_TAG }}"
           RG="${{ steps.vars.outputs.RG }}"
           ENV_NAME="${{ steps.vars.outputs.ENV_NAME }}"
+          REG_SERVER="${{ env.ACR_LOGIN_SERVER }}"
 
           upsert_app () {
-            local NAME=$1 PORT=$2 IMAGE=$3 EXTRA=${4:-}
+            local NAME=$1
+            local PORT=$2
+            local IMAGE=$3
+            local EXTRA_ARGS=${4:-}
+
             if az containerapp show -g "$RG" -n "$NAME" >/dev/null 2>&1; then
-              az containerapp update -g "$RG" -n "$NAME" --image "$IMAGE" $EXTRA
+              # ensure the app knows about the registry via system identity
+              az containerapp registry set \
+                -g "$RG" -n "$NAME" \
+                --server "$REG_SERVER" \
+                --identity system
+
+              az containerapp update \
+                -g "$RG" -n "$NAME" \
+                --image "$IMAGE" \
+                $EXTRA_ARGS
             else
-              az containerapp create -g "$RG" -n "$NAME" \
+              az containerapp create \
+                -g "$RG" -n "$NAME" \
                 --environment "$ENV_NAME" \
                 --image "$IMAGE" \
                 --ingress external --target-port "$PORT" --transport auto \
-                $EXTRA
+                --registry-server "$REG_SERVER" \
+                --registry-identity system \
+                $EXTRA_ARGS
             fi
           }
 
-          upsert_app "customer-service" 8002 "${{ env.ACR_LOGIN_SERVER }}/customer-service:${IMAGE_TAG}"
+          # customer-service (8002)
+          upsert_app "customer-service" 8002 "${REG_SERVER}/customer-service:${IMAGE_TAG}"
           CUSTOMER_FQDN=$(az containerapp show -g "$RG" -n customer-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          upsert_app "product-service" 8003 "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}"
+          # product-service (8003)
+          upsert_app "product-service"  8003 "${REG_SERVER}/product-service:${IMAGE_TAG}"
           PRODUCT_FQDN=$(az containerapp show -g "$RG" -n product-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          upsert_app "order-service" 8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
+          # order-service (8001) depends on customer URL
+          upsert_app "order-service" 8001 "${REG_SERVER}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
           ORDER_FQDN=$(az containerapp show -g "$RG" -n order-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          upsert_app "frontend" 80 "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}"
+          # frontend (80)
+          upsert_app "frontend" 80 "${REG_SERVER}/frontend:${IMAGE_TAG}"
           FRONTEND_FQDN=$(az containerapp show -g "$RG" -n frontend --query "properties.configuration.ingress.fqdn" -o tsv)
 
           echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"  >> "$GITHUB_OUTPUT"
@@ -128,6 +172,7 @@ jobs:
       - name: Smoke test (light)
         run: |
           set -e
+          echo "Waiting for apps to warm up..."
           sleep 30
           curl -fsS "${{ steps.deploy.outputs.FRONTEND_URL }}" >/dev/null
           curl -fsS "${{ steps.deploy.outputs.CUSTOMER_URL }}/health" || true
