@@ -61,7 +61,6 @@ jobs:
           elif [ -f ../../requirements.txt ]; then
             python -m pip install -r ../../requirements.txt
           fi
-          # Always ensure test/runtime deps are present
           python -m pip install pytest pytest-asyncio httpx psycopg2-binary
 
       - name: Install psql client (for DB creation)
@@ -73,12 +72,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          # Decide DB name based on service
           DB=customers
           if [ "${{ matrix.service }}" = "order_service" ]; then DB=orders; fi
           if [ "${{ matrix.service }}" = "product_service" ]; then DB=products; fi
-
-          # Create DB if missing
           psql -h localhost -U postgres -p 5432 -tc "SELECT 1 FROM pg_database WHERE datname='${DB}'" | grep -q 1 || \
             psql -h localhost -U postgres -p 5432 -c "CREATE DATABASE ${DB};"
           echo "Created/verified database: ${DB}"
@@ -88,13 +84,11 @@ jobs:
 
       - name: Run tests
         env:
-          # Many test setups/apps read these env vars
           POSTGRES_HOST: localhost
           POSTGRES_PORT: 5432
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ${{ matrix.service == 'customer_service' && 'customers' || (matrix.service == 'order_service' && 'orders' || 'products') }}
-          # If your app reads a single DATABASE_URL, set it too:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/${{ matrix.service == 'customer_service' && 'customers' || (matrix.service == 'order_service' && 'orders' || 'products') }}
         run: python -m pytest -q
 

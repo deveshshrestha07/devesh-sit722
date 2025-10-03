@@ -1,7 +1,29 @@
+name: Stage 2 - Provision Staging & Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]
+    types: [completed]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  LOCATION: australiaeast
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  RG_PREFIX: sit722-staging
+
+concurrency:
+  group: stage2-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   deploy-staging:
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -10,7 +32,6 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ✅ Add the Container Apps CLI extension
       - name: Install Azure CLI extensions
         run: |
           az extension add --name containerapp --upgrade -y
@@ -35,7 +56,6 @@ jobs:
           az provider register --namespace Microsoft.App --wait
           az provider register --namespace Microsoft.OperationalInsights --wait
 
-      # ✅ Create Log Analytics workspace and grab keys
       - name: Create Log Analytics workspace
         id: la
         run: |
@@ -58,3 +78,86 @@ jobs:
             --logs-workspace-id  "${{ steps.la.outputs.id }}" \
             --logs-workspace-key "${{ steps.la.outputs.key }}" \
             --assign-identity
+
+      - name: Grant env identity ACR Pull & set registry
+        shell: bash
+        run: |
+          ACR_ID=$(az acr show -n "${{ env.ACR_NAME }}" --query id -o tsv)
+          ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "${{ steps.vars.outputs.RG }}" -n "${{ steps.vars.outputs.ENV_NAME }}" --query identity.principalId -o tsv)
+          az role assignment create \
+            --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role AcrPull \
+            --scope "$ACR_ID"
+          az containerapp registry set \
+            -g "${{ steps.vars.outputs.RG }}" \
+            --environment "${{ steps.vars.outputs.ENV_NAME }}" \
+            --server "${{ env.ACR_LOGIN_SERVER }}" \
+            --identity system
+
+      - name: Deploy services
+        id: deploy
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ steps.vars.outputs.IMAGE_TAG }}"
+          RG="${{ steps.vars.outputs.RG }}"
+          ENV_NAME="${{ steps.vars.outputs.ENV_NAME }}"
+
+          az containerapp create -g "$RG" -n customer-service \
+            --environment "$ENV_NAME" \
+            --image "${{ env.ACR_LOGIN_SERVER }}/customer-service:${IMAGE_TAG}" \
+            --ingress external --target-port 8002 --transport auto
+          CUSTOMER_FQDN=$(az containerapp show -g "$RG" -n customer-service --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          az containerapp create -g "$RG" -n product-service \
+            --environment "$ENV_NAME" \
+            --image "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}" \
+            --ingress external --target-port 8003 --transport auto
+          PRODUCT_FQDN=$(az containerapp show -g "$RG" -n product-service --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          az containerapp create -g "$RG" -n order-service \
+            --environment "$ENV_NAME" \
+            --image "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" \
+            --ingress external --target-port 8001 --transport auto \
+            --env-vars CUSTOMER_SERVICE_URL="http://${CUSTOMER_FQDN}"
+          ORDER_FQDN=$(az containerapp show -g "$RG" -n order-service --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          az containerapp create -g "$RG" -n frontend \
+            --environment "$ENV_NAME" \
+            --image "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}" \
+            --ingress external --target-port 80 --transport auto
+          FRONTEND_FQDN=$(az containerapp show -g "$RG" -n frontend --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"  >> "$GITHUB_OUTPUT"
+          echo "PRODUCT_URL=http://${PRODUCT_FQDN}"    >> "$GITHUB_OUTPUT"
+          echo "ORDER_URL=http://${ORDER_FQDN}"        >> "$GITHUB_OUTPUT"
+          echo "FRONTEND_URL=http://${FRONTEND_FQDN}"  >> "$GITHUB_OUTPUT"
+
+      - name: Wait & smoke test
+        shell: bash
+        run: |
+          set -e
+          echo "Waiting for apps to warm up..."
+          sleep 30
+          curl -fsS "${{ steps.deploy.outputs.FRONTEND_URL }}" >/dev/null || (echo "frontend not ready"; exit 1)
+          curl -fsS "${{ steps.deploy.outputs.CUSTOMER_URL }}/health" || true
+          curl -fsS "${{ steps.deploy.outputs.PRODUCT_URL }}/health" || true
+          curl -fsS "${{ steps.deploy.outputs.ORDER_URL }}/health"   || true
+
+      - name: Save RG/env for teardown
+        run: |
+          echo "${{ steps.vars.outputs.RG }}"       > staging-rg.txt
+          echo "${{ steps.vars.outputs.ENV_NAME }}" > staging-env.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: staging-info
+          path: |
+            staging-rg.txt
+            staging-env.txt
+
+      - name: Print URLs
+        run: |
+          echo "FRONTEND: ${{ steps.deploy.outputs.FRONTEND_URL }}"
+          echo "CUSTOMER: ${{ steps.deploy.outputs.CUSTOMER_URL }}"
+          echo "PRODUCT : ${{ steps.deploy.outputs.PRODUCT_URL }}"
+          echo "ORDER   : ${{ steps.deploy.outputs.ORDER_URL }}"
