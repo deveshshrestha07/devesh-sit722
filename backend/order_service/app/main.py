@@ -38,10 +38,12 @@ logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
 # --- Service URLs Configuration ---
 CUSTOMER_SERVICE_URL = os.getenv("CUSTOMER_SERVICE_URL", "http://localhost:8002")
+# Exported for tests to import
+PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8003")
+
 logger.info(
     f"Order Service: Configured to communicate with Customer Service at: {CUSTOMER_SERVICE_URL}"
 )
-
 
 # --- RabbitMQ Configuration ---
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
@@ -69,7 +71,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # --- RabbitMQ Helper Functions ---
 async def connect_to_rabbitmq():
@@ -213,7 +214,6 @@ async def consume_stock_events(db_session_factory: Session):
                             logger.warning(
                                 f"Order Service: Order {order_id} status updated to 'failed' based on stock deduction failure. Details: {message_data.get('details')}"
                             )
-                            # In a real app, you might publish a compensation event here or trigger alerts.
                         else:
                             logger.warning(
                                 f"Order Service: Received unknown routing key '{routing_key}' for order {order_id}."
@@ -545,7 +545,8 @@ async def update_order_status(
             status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
         )
 
-    db_order.status = new_status
+    # FIX: use the field from the pydantic model
+    db_order.status = new_status.status
 
     try:
         db.add(db_order)
