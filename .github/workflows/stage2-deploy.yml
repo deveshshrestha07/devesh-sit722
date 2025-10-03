@@ -1,8 +1,8 @@
-name: Stage 2 - Provision Staging & Deploy (Minimal, Works)
+name: Stage 2 - Provision Staging & Deploy (No Logs, Works)
 
 on:
   workflow_run:
-    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]   # must match Stage 1 name exactly
+    workflows: ["CI - Test, Build & Push to ACR (Stage 1)"]
     types: [completed]
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
   id-token: write
 
 env:
-  # Use the fixed RG you granted Contributor to:
+  # deploy into the fixed RG you already granted Contributor to
   STAGING_RG: sit722-staging-fixed
   LOCATION: australiaeast
   ACR_NAME: ${{ secrets.ACR_NAME }}
@@ -22,7 +22,6 @@ concurrency:
 
 jobs:
   deploy-staging:
-    # run only if Stage 1 succeeded and was for 'testing' branch
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
 
@@ -46,24 +45,24 @@ jobs:
           echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
           echo "ENV_NAME=aca-${{ github.run_id }}"                   >> "$GITHUB_OUTPUT"
 
-      # OPTIONAL: ensure the target RG exists (will succeed if it already exists)
       - name: Ensure resource group exists
         run: |
           az group create -n "${{ env.STAGING_RG }}" -l "${{ env.LOCATION }}"
 
-      # Create Container Apps environment (NO Log Analytics, NO identity)
-      - name: Create Container Apps environment
+      # ⛔ EXPLICITLY DISABLE LOG ANALYTICS
+      - name: Create Container Apps environment (no logs)
         run: |
           if ! az containerapp env show -g "${{ env.STAGING_RG }}" -n "${{ steps.vars.outputs.ENV_NAME }}" >/dev/null 2>&1; then
             az containerapp env create \
               -g "${{ env.STAGING_RG }}" \
               -n "${{ steps.vars.outputs.ENV_NAME }}" \
-              -l "${{ env.LOCATION }}"
+              -l "${{ env.LOCATION }}" \
+              --logs-destination none
           else
             echo "Env exists: ${{ steps.vars.outputs.ENV_NAME }}"
           fi
 
-      # Get ACR credentials (preferred) OR use secrets fallback
+      # Get ACR credentials (or fallback to repo secrets ACR_USERNAME/ACR_PASSWORD)
       - name: Resolve ACR credentials
         id: acr
         shell: bash
@@ -71,27 +70,21 @@ jobs:
           set -e
           USERNAME=""
           PASSWORD=""
-
           if az acr show -n "${{ env.ACR_NAME }}" >/dev/null 2>&1; then
             USERNAME=$(az acr credential show -n "${{ env.ACR_NAME }}" --query "username" -o tsv)
             PASSWORD=$(az acr credential show -n "${{ env.ACR_NAME }}" --query "passwords[0].value" -o tsv)
           fi
-
-          # Fallback to repo secrets if credential show is blocked by RBAC
           if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
             USERNAME="${{ secrets.ACR_USERNAME }}"
             PASSWORD="${{ secrets.ACR_PASSWORD }}"
           fi
-
           if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
-            echo "ACR credentials not available. Provide ACR_USERNAME/ACR_PASSWORD repo secrets or grant 'AcrPull' and 'AcrPush' to this principal."
+            echo "ACR credentials not available. Add ACR_USERNAME and ACR_PASSWORD repo secrets or grant this principal ACR admin."
             exit 1
           fi
-
           echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
           echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
 
-      # Deploy / Update apps (use registry creds directly)
       - name: Deploy/Update services (Container Apps)
         id: deploy
         shell: bash
@@ -128,20 +121,16 @@ jobs:
             fi
           }
 
-          # customer-service (8002)
           upsert_app "customer-service" 8002 "${REG_SERVER}/customer-service:${IMAGE_TAG}"
           CUSTOMER_FQDN=$(az containerapp show -g "$RG" -n customer-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # product-service (8003)
           upsert_app "product-service"  8003 "${REG_SERVER}/product-service:${IMAGE_TAG}"
           PRODUCT_FQDN=$(az containerapp show -g "$RG" -n product-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # order-service (8001) depends on customer URL
-          upsert_app "order-service" 8001 "${REG_SERVER}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
+          upsert_app "order-service"    8001 "${REG_SERVER}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
           ORDER_FQDN=$(az containerapp show -g "$RG" -n order-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          # frontend (80)
-          upsert_app "frontend" 80 "${REG_SERVER}/frontend:${IMAGE_TAG}"
+          upsert_app "frontend"            80 "${REG_SERVER}/frontend:${IMAGE_TAG}"
           FRONTEND_FQDN=$(az containerapp show -g "$RG" -n frontend --query "properties.configuration.ingress.fqdn" -o tsv)
 
           echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"  >> "$GITHUB_OUTPUT"
