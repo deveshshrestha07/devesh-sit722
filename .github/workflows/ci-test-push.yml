@@ -40,12 +40,6 @@ jobs:
       run:
         working-directory: backend/${{ matrix.service }}
         shell: bash
-    # Env the apps expect (matches the DSNs seen in your logs)
-    env:
-      POSTGRES_HOST: localhost
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
 
@@ -54,40 +48,20 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Upgrade pip tooling
-        run: python -m pip install --upgrade pip setuptools wheel
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
-      - name: Install core test deps
-        run: python -m pip install pytest pytest-asyncio anyio httpx psycopg2-binary sqlalchemy fastapi
-
-      - name: Install service requirements (if any)
+      - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           elif [ -f ../../requirements.txt ]; then
             python -m pip install -r ../../requirements.txt
+          else
+            python -m pip install pytest
           fi
 
-      - name: Wait for Postgres
-        run: |
-          for i in {1..30}; do
-            pg_isready -h localhost -p 5432 -U postgres && break
-            sleep 2
-          done
-
-      - name: Create DB for this service
-        env:
-          PGPASSWORD: postgres
-        run: |
-          sudo apt-get update -y && sudo apt-get install -y postgresql-client
-          DB=orders
-          if [ "${{ matrix.service }}" = "customer_service" ]; then DB=customers; fi
-          if [ "${{ matrix.service }}" = "product_service" ]; then DB=products; fi
-          psql -h localhost -U postgres -p 5432 -tc "SELECT 1 FROM pg_database WHERE datname='${DB}'" | grep -q 1 || \
-            psql -h localhost -U postgres -p 5432 -c "CREATE DATABASE ${DB};"
-          echo "Created/verified database: ${DB}"
-
-      - name: Show pytest version
+      - name: Show pytest version (debug)
         run: python -m pytest --version
 
       - name: Run tests
