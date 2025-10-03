@@ -18,11 +18,7 @@ jobs:
   test:
     name: Run service tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        service: [customer_service, order_service, product_service]
-    # Start PostgreSQL for the test job
+
     services:
       postgres:
         image: postgres:15
@@ -36,10 +32,17 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [customer_service, order_service, product_service]
+
     defaults:
       run:
         working-directory: backend/${{ matrix.service }}
         shell: bash
+
     steps:
       - uses: actions/checkout@v4
 
@@ -51,20 +54,48 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Install dependencies
+      - name: Install Python deps (always include pytest)
         run: |
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           elif [ -f ../../requirements.txt ]; then
             python -m pip install -r ../../requirements.txt
-          else
-            python -m pip install pytest
           fi
+          # Always ensure test/runtime deps are present
+          python -m pip install pytest pytest-asyncio httpx psycopg2-binary
+
+      - name: Install psql client (for DB creation)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Create DB for this service
+        env:
+          PGPASSWORD: postgres
+        run: |
+          # Decide DB name based on service
+          DB=customers
+          if [ "${{ matrix.service }}" = "order_service" ]; then DB=orders; fi
+          if [ "${{ matrix.service }}" = "product_service" ]; then DB=products; fi
+
+          # Create DB if missing
+          psql -h localhost -U postgres -p 5432 -tc "SELECT 1 FROM pg_database WHERE datname='${DB}'" | grep -q 1 || \
+            psql -h localhost -U postgres -p 5432 -c "CREATE DATABASE ${DB};"
+          echo "Created/verified database: ${DB}"
 
       - name: Show pytest version (debug)
         run: python -m pytest --version
 
       - name: Run tests
+        env:
+          # Many test setups/apps read these env vars
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ matrix.service == 'customer_service' && 'customers' || (matrix.service == 'order_service' && 'orders' || 'products') }}
+          # If your app reads a single DATABASE_URL, set it too:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/${{ matrix.service == 'customer_service' && 'customers' || (matrix.service == 'order_service' && 'orders' || 'products') }}
         run: python -m pytest -q
 
   build_and_push:
@@ -72,6 +103,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     if: ${{ needs.test.result == 'success' }}
+
     steps:
       - uses: actions/checkout@v4
 
