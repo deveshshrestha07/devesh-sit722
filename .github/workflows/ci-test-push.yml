@@ -15,52 +15,50 @@ env:
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
 
 jobs:
-  # ---- 1) TESTS -------------------------------------------------------------
   test:
     name: Run service tests
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service:
-          - customer_service
-          - order_service
-          - product_service
+        service: [customer_service, order_service, product_service]
     defaults:
       run:
         working-directory: backend/${{ matrix.service }}
+        shell: bash
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
       - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+            python -m pip install -r requirements.txt
+          elif [ -f ../../requirements.txt ]; then
+            python -m pip install -r ../../requirements.txt
           else
-            pip install pytest
+            python -m pip install pytest
           fi
 
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q
 
-  # ---- 2) BUILD & PUSH (only if tests passed) ------------------------------
   build_and_push:
     name: Build and push images to ACR
     needs: test
     runs-on: ubuntu-latest
     if: ${{ needs.test.result == 'success' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ✅ OIDC login with your three Azure secrets
-      - name: Azure login
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -86,12 +84,11 @@ jobs:
 
       - name: Publish image references
         run: |
-          {
-            echo "$ACR_LOGIN_SERVER/customer-service:${IMAGE_TAG}"
-            echo "$ACR_LOGIN_SERVER/order-service:${IMAGE_TAG}"
-            echo "$ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}"
-            echo "$ACR_LOGIN_SERVER/frontend:${IMAGE_TAG}"
-          } > image-refs.txt
+          printf "%s\n" \
+            "$ACR_LOGIN_SERVER/customer-service:${IMAGE_TAG}" \
+            "$ACR_LOGIN_SERVER/order-service:${IMAGE_TAG}" \
+            "$ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}" \
+            "$ACR_LOGIN_SERVER/frontend:${IMAGE_TAG}" > image-refs.txt
       - uses: actions/upload-artifact@v4
         with:
           name: image-refs
