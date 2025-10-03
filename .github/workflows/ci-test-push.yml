@@ -26,6 +26,8 @@ jobs:
       run:
         working-directory: backend/${{ matrix.service }}
         shell: bash
+    env:
+      PYTHONPATH: ${{ github.workspace }}/backend/${{ matrix.service }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,18 +36,25 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+      - name: Upgrade pip tooling
+        run: python -m pip install --upgrade pip setuptools wheel
 
-      - name: Install dependencies
+      # Always have test tools available
+      - name: Install core test deps
+        run: |
+          python -m pip install pytest pytest-asyncio anyio httpx
+
+      # Then install service or root requirements if present (optional)
+      - name: Install service requirements (if any)
         run: |
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           elif [ -f ../../requirements.txt ]; then
             python -m pip install -r ../../requirements.txt
-          else
-            python -m pip install pytest
           fi
+
+      - name: Show pytest version (debug)
+        run: python -m pytest --version
 
       - name: Run tests
         run: python -m pytest -q
