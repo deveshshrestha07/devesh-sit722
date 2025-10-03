@@ -1,0 +1,88 @@
+name: Stage 3 - Deploy to Production
+
+on:
+  push:
+    branches: [ "main" ]     # deploy automatically on merge to main
+  workflow_dispatch:          # or trigger manually
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  PROD_RG: ${{ secrets.PROD_RG }}
+  PROD_ENV_NAME: ${{ secrets.PROD_ENV_NAME }}
+
+  CUSTOMER_APP: ${{ secrets.PROD_CUSTOMER_APP || 'customer-service' }}
+  PRODUCT_APP:  ${{ secrets.PROD_PRODUCT_APP  || 'product-service'  }}
+  ORDER_APP:    ${{ secrets.PROD_ORDER_APP    || 'order-service'    }}
+  FRONTEND_APP: ${{ secrets.PROD_FRONTEND_APP || 'frontend'         }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Container Apps extension
+        run: az extension add --name containerapp --upgrade -y
+
+      - name: Compute image tag (use this commit)
+        id: vars
+        run: echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Update production apps to new images
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+        run: |
+          set -e
+
+          IMAGE_CUSTOMER="${ACR_LOGIN_SERVER}/customer-service:${IMAGE_TAG}"
+          IMAGE_PRODUCT="${ACR_LOGIN_SERVER}/product-service:${IMAGE_TAG}"
+          IMAGE_ORDER="${ACR_LOGIN_SERVER}/order-service:${IMAGE_TAG}"
+          IMAGE_FRONTEND="${ACR_LOGIN_SERVER}/frontend:${IMAGE_TAG}"
+
+          # Update apps in place (apps must already exist in the prod env)
+          az containerapp update -g "$PROD_RG" -n "$CUSTOMER_APP" --image "$IMAGE_CUSTOMER"
+          az containerapp update -g "$PROD_RG" -n "$PRODUCT_APP"  --image "$IMAGE_PRODUCT"
+
+          # Order service may need CUSTOMER_SERVICE_URL; keep the existing value:
+          CURR_CUSTOMER_URL=$(az containerapp show -g "$PROD_RG" -n "$CUSTOMER_APP" \
+                               --query "properties.configuration.ingress.fqdn" -o tsv)
+          az containerapp update -g "$PROD_RG" -n "$ORDER_APP" \
+            --image "$IMAGE_ORDER" \
+            --set-env-vars "CUSTOMER_SERVICE_URL=http://${CURR_CUSTOMER_URL}"
+
+          az containerapp update -g "$PROD_RG" -n "$FRONTEND_APP" --image "$IMAGE_FRONTEND"
+
+      - name: Light smoke checks
+        run: |
+          set -e
+          sleep 20
+
+          get_url () { az containerapp show -g "$PROD_RG" -n "$1" --query "properties.configuration.ingress.fqdn" -o tsv; }
+
+          FRONTEND_URL="http://$(get_url "$FRONTEND_APP")"
+          CUSTOMER_URL="http://$(get_url "$CUSTOMER_APP")"
+          PRODUCT_URL="http://$(get_url "$PRODUCT_APP")"
+          ORDER_URL="http://$(get_url "$ORDER_APP")"
+
+          echo "FRONTEND: $FRONTEND_URL"
+          echo "CUSTOMER: $CUSTOMER_URL"
+          echo "PRODUCT : $PRODUCT_URL"
+          echo "ORDER   : $ORDER_URL"
+
+          curl -fsS "$FRONTEND_URL" >/dev/null
+          curl -fsS "$CUSTOMER_URL/health" || true
+          curl -fsS "$PRODUCT_URL/health"  || true
+          curl -fsS "$ORDER_URL/health"    || true
