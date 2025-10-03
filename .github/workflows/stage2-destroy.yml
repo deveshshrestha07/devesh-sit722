@@ -25,4 +25,5 @@ jobs:
       - name: Delete RG
         run: |
           az group delete -n "${{ inputs.resource_group }}" --yes --no-wait
-          echo "Requested deletion of RG: ${{ inputs.resource_group }}"
+          echo "Requested deletion of RG: ${{
+            inputs.resource_group }}"
