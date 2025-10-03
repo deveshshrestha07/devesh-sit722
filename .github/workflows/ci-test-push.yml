@@ -1,0 +1,102 @@
+name: CI - Test, Build & Push to ACR (Stage 1)
+
+on:
+  push:
+    branches: [ "testing" ]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+
+jobs:
+  # ---- 1) TESTS -------------------------------------------------------------
+  test:
+    name: Run service tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - customer_service
+          - order_service
+          - product_service
+    defaults:
+      run:
+        working-directory: backend/${{ matrix.service }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Try service-specific requirements if present; otherwise install basics
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pytest
+          fi
+
+      - name: Run tests
+        run: pytest -q
+
+  # ---- 2) BUILD & PUSH (only if tests passed) ------------------------------
+  build_and_push:
+    name: Build and push images to ACR
+    needs: test
+    runs-on: ubuntu-latest
+    if: ${{ needs.test.result == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Login to Azure using OIDC + your federated credential
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name $ACR_NAME
+
+      - name: Build images
+        run: |
+          # Backend services
+          docker build -f backend/customer_service/Dockerfile -t $ACR_LOGIN_SERVER/customer-service:${IMAGE_TAG} backend/customer_service
+          docker build -f backend/order_service/Dockerfile    -t $ACR_LOGIN_SERVER/order-service:${IMAGE_TAG}    backend/order_service
+          docker build -f backend/product_service/Dockerfile  -t $ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}  backend/product_service
+
+          # Frontend (optional—remove if you don't want to push it in Stage 1)
+          docker build -f frontend/Dockerfile -t $ACR_LOGIN_SERVER/frontend:${IMAGE_TAG} frontend
+
+      - name: Push images
+        run: |
+          docker push $ACR_LOGIN_SERVER/customer-service:${IMAGE_TAG}
+          docker push $ACR_LOGIN_SERVER/order-service:${IMAGE_TAG}
+          docker push $ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}
+          docker push $ACR_LOGIN_SERVER/frontend:${IMAGE_TAG}
+
+      # (Optional) Upload a small artifact listing the image refs for downstream jobs
+      - name: Publish image references
+        run: |
+          {
+            echo "$ACR_LOGIN_SERVER/customer-service:${IMAGE_TAG}"
+            echo "$ACR_LOGIN_SERVER/order-service:${IMAGE_TAG}"
+            echo "$ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}"
+            echo "$ACR_LOGIN_SERVER/frontend:${IMAGE_TAG}"
+          } > image-refs.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-refs
+          path: image-refs.txt
