@@ -23,9 +23,7 @@ jobs:
   deploy-staging:
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
+    defaults: { run: { shell: bash } }
 
     steps:
       - name: Azure login (OIDC)
@@ -35,9 +33,12 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install Azure CLI extension (Container Apps)
+      - name: Install Container Apps extension
         run: |
           az extension add --name containerapp --upgrade -y || az extension update --name containerapp -y
+
+      # (Optional) checkout just to help us verify what's on main
+      - uses: actions/checkout@v4
 
       - name: Compute variables
         id: vars
@@ -50,11 +51,10 @@ jobs:
         run: az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
 
       - name: Ensure providers registered
-        run: |
-          az provider register --namespace Microsoft.App --wait
+        run: az provider register --namespace Microsoft.App --wait
 
-      # ⬇️ IMPORTANT: No Log Analytics flags here (avoids CustomerId whitespace error)
-      - name: Create Container Apps environment (no Log Analytics)
+      # ✅ No Log Analytics flags here
+      - name: Create Container Apps environment (no LA)
         run: |
           az containerapp env create \
             -g "${{ steps.vars.outputs.RG }}" \
@@ -76,20 +76,18 @@ jobs:
             -g "${{ steps.vars.outputs.RG }}" \
             -n "${{ steps.vars.outputs.ENV_NAME }}" \
             --query identity.principalId -o tsv)
-
           az role assignment create \
             --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
             --assignee-principal-type ServicePrincipal \
             --role AcrPull \
             --scope "$ACR_ID"
-
           az containerapp registry set \
             -g "${{ steps.vars.outputs.RG }}" \
             --environment "${{ steps.vars.outputs.ENV_NAME }}" \
             --server "${{ env.ACR_LOGIN_SERVER }}" \
             --identity system
 
-      - name: Deploy/Update services (Container Apps)
+      - name: Deploy/Update services
         id: deploy
         run: |
           set -e
@@ -98,31 +96,28 @@ jobs:
           ENV_NAME="${{ steps.vars.outputs.ENV_NAME }}"
 
           upsert_app () {
-            local NAME=$1
-            local PORT=$2
-            local IMAGE=$3
-            local EXTRA_ARGS=${4:-}
+            local NAME=$1 PORT=$2 IMAGE=$3 EXTRA=${4:-}
             if az containerapp show -g "$RG" -n "$NAME" >/dev/null 2>&1; then
-              az containerapp update -g "$RG" -n "$NAME" --image "$IMAGE" $EXTRA_ARGS
+              az containerapp update -g "$RG" -n "$NAME" --image "$IMAGE" $EXTRA
             else
               az containerapp create -g "$RG" -n "$NAME" \
                 --environment "$ENV_NAME" \
                 --image "$IMAGE" \
                 --ingress external --target-port "$PORT" --transport auto \
-                $EXTRA_ARGS
+                $EXTRA
             fi
           }
 
           upsert_app "customer-service" 8002 "${{ env.ACR_LOGIN_SERVER }}/customer-service:${IMAGE_TAG}"
           CUSTOMER_FQDN=$(az containerapp show -g "$RG" -n customer-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          upsert_app "product-service"  8003 "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}"
+          upsert_app "product-service" 8003 "${{ env.ACR_LOGIN_SERVER }}/product-service:${IMAGE_TAG}"
           PRODUCT_FQDN=$(az containerapp show -g "$RG" -n product-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          upsert_app "order-service"    8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
+          upsert_app "order-service" 8001 "${{ env.ACR_LOGIN_SERVER }}/order-service:${IMAGE_TAG}" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
           ORDER_FQDN=$(az containerapp show -g "$RG" -n order-service --query "properties.configuration.ingress.fqdn" -o tsv)
 
-          upsert_app "frontend"           80 "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}"
+          upsert_app "frontend" 80 "${{ env.ACR_LOGIN_SERVER }}/frontend:${IMAGE_TAG}"
           FRONTEND_FQDN=$(az containerapp show -g "$RG" -n frontend --query "properties.configuration.ingress.fqdn" -o tsv)
 
           echo "CUSTOMER_URL=http://${CUSTOMER_FQDN}"  >> "$GITHUB_OUTPUT"
@@ -133,7 +128,6 @@ jobs:
       - name: Smoke test (light)
         run: |
           set -e
-          echo "Waiting for apps to warm up..."
           sleep 30
           curl -fsS "${{ steps.deploy.outputs.FRONTEND_URL }}" >/dev/null
           curl -fsS "${{ steps.deploy.outputs.CUSTOMER_URL }}/health" || true
