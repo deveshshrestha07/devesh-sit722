@@ -2,22 +2,37 @@ name: Stage 3 - Deploy to Production (upsert)
 
 on:
   push:
-    branches: ["main"]      # auto-deploy on merge to main
-  workflow_dispatch:        # allow manual runs
+    branches: ["main"]          # auto-deploy on merge to main
+  workflow_dispatch:            # allow manual runs with optional tag override
+    inputs:
+      image_tag:
+        description: "ACR image tag to deploy (defaults to this commit SHA)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
   id-token: write
 
 env:
+  # ACR
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+
+  # Prod infra (must already exist)
   PROD_RG: ${{ secrets.PROD_RG }}             # e.g. sit722-staging-18219577214
   PROD_ENV_NAME: ${{ secrets.PROD_ENV_NAME }} # e.g. aca-18219577214
+
+  # App names (override via repo secrets if different in prod)
+  CUSTOMER_APP: ${{ secrets.PROD_CUSTOMER_APP || 'customer-service' }}
+  PRODUCT_APP:  ${{ secrets.PROD_PRODUCT_APP  || 'product-service'  }}
+  ORDER_APP:    ${{ secrets.PROD_ORDER_APP    || 'order-service'    }}
+  FRONTEND_APP: ${{ secrets.PROD_FRONTEND_APP || 'frontend'         }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -29,70 +44,43 @@ jobs:
       - name: Install Container Apps extension
         run: az extension add --name containerapp --upgrade -y
 
-      # Normalize inputs & compute defaults safely (no "||" in expressions)
-      - name: Normalize inputs & defaults
-        id: norm
-        shell: bash
+      - name: Normalize prod inputs (trim whitespace)
         run: |
-          # trim whitespace that often sneaks into secrets
           RG_TRIM=$(printf "%s" "$PROD_RG" | tr -d '[:space:]')
           ENV_TRIM=$(printf "%s" "$PROD_ENV_NAME" | tr -d '[:space:]')
-          ACR_SRV_TRIM=$(printf "%s" "$ACR_LOGIN_SERVER" | sed -E 's#^https?://##')
-
-          # allow optional overrides via secrets; fallback to sane defaults
-          CUSTOMER_APP="${{ secrets.PROD_CUSTOMER_APP }}"
-          PRODUCT_APP="${{ secrets.PROD_PRODUCT_APP }}"
-          ORDER_APP="${{ secrets.PROD_ORDER_APP }}"
-          FRONTEND_APP="${{ secrets.PROD_FRONTEND_APP }}"
-          : "${CUSTOMER_APP:=customer-service}"
-          : "${PRODUCT_APP:=product-service}"
-          : "${ORDER_APP:=order-service}"
-          : "${FRONTEND_APP:=frontend}"
-
-          # commit to environment for subsequent steps
-          {
-            echo "PROD_RG=$RG_TRIM"
-            echo "PROD_ENV_NAME=$ENV_TRIM"
-            echo "ACR_LOGIN_SERVER=$ACR_SRV_TRIM"
-            echo "CUSTOMER_APP=$CUSTOMER_APP"
-            echo "PRODUCT_APP=$PRODUCT_APP"
-            echo "ORDER_APP=$ORDER_APP"
-            echo "FRONTEND_APP=$FRONTEND_APP"
-          } >> "$GITHUB_ENV"
-
-          echo "Using RG='$RG_TRIM' ENV='$ENV_TRIM' ACR='$ACR_SRV_TRIM'"
-          echo "Apps: $CUSTOMER_APP, $PRODUCT_APP, $ORDER_APP, $FRONTEND_APP"
+          echo "PROD_RG=$RG_TRIM" >> "$GITHUB_ENV"
+          echo "PROD_ENV_NAME=$ENV_TRIM" >> "$GITHUB_ENV"
 
       - name: Verify Container Apps environment exists
-        shell: bash
         run: |
           set -e
           if ! az containerapp env show -g "$PROD_RG" -n "$PROD_ENV_NAME" >/dev/null 2>&1; then
-            echo "::error::Container Apps environment '$PROD_ENV_NAME' not found in RG '$PROD_RG'."
-            echo "Create it once (Portal/CLI) or fix the PROD_RG/PROD_ENV_NAME secrets."
+            echo "::error::Container Apps environment '$PROD_ENV_NAME' not found in RG '$PROD_RG'. Create it once and re-run."
             exit 1
           fi
 
-      # Use :latest to avoid MANIFEST_UNKNOWN when main’s SHA was never pushed
-      - name: Compute image tag (use latest)
-        id: vars
-        run: echo "IMAGE_TAG=latest" >> "$GITHUB_OUTPUT"
+      - name: Choose image tag (dispatch input or this commit SHA)
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Ensure env can pull from ACR (idempotent)
-        shell: bash
         run: |
           set -e
           ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "$PROD_RG" -n "$PROD_ENV_NAME" --query identity.principalId -o tsv || true)
           if [ -n "$ENV_MI_PRINCIPAL_ID" ]; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
-            # grant AcrPull if not already present
             az role assignment create \
               --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
               --assignee-principal-type ServicePrincipal \
               --role AcrPull \
               --scope "$ACR_ID" >/dev/null 2>&1 || true
 
-            # some CLI revs support setting registry on env; swallow if unsupported
+            # Registry on env (noop if already set)
             az containerapp registry set \
               -g "$PROD_RG" \
               --environment "$PROD_ENV_NAME" \
@@ -103,46 +91,62 @@ jobs:
       - name: Upsert apps in production
         id: upsert
         env:
-          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
-        shell: bash
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
         run: |
           set -e
+
           IMG_CUSTOMER="${ACR_LOGIN_SERVER}/customer-service:${IMAGE_TAG}"
           IMG_PRODUCT="${ACR_LOGIN_SERVER}/product-service:${IMAGE_TAG}"
           IMG_ORDER="${ACR_LOGIN_SERVER}/order-service:${IMAGE_TAG}"
           IMG_FRONTEND="${ACR_LOGIN_SERVER}/frontend:${IMAGE_TAG}"
 
           upsert () {
-            local NAME=$1 PORT=$2 IMAGE=$3 EXTRA_ARGS=${4:-}
+            local NAME="$1" PORT="$2" IMAGE="$3" EXTRA_ENV="$4"
+
             if az containerapp show -g "$PROD_RG" -n "$NAME" >/dev/null 2>&1; then
-              az containerapp update -g "$PROD_RG" -n "$NAME" --image "$IMAGE" $EXTRA_ARGS
+              # UPDATE path — env vars use --set-env-vars
+              if [ -n "$EXTRA_ENV" ]; then
+                az containerapp update -g "$PROD_RG" -n "$NAME" \
+                  --image "$IMAGE" \
+                  --set-env-vars $EXTRA_ENV
+              else
+                az containerapp update -g "$PROD_RG" -n "$NAME" \
+                  --image "$IMAGE"
+              fi
             else
-              az containerapp create -g "$PROD_RG" -n "$NAME" \
-                --environment "$PROD_ENV_NAME" \
-                --image "$IMAGE" \
-                --ingress external --target-port "$PORT" --transport auto \
-                $EXTRA_ARGS
+              # CREATE path — env vars use --env-vars
+              if [ -n "$EXTRA_ENV" ]; then
+                az containerapp create -g "$PROD_RG" -n "$NAME" \
+                  --environment "$PROD_ENV_NAME" \
+                  --image "$IMAGE" \
+                  --ingress external --target-port "$PORT" --transport auto \
+                  --env-vars $EXTRA_ENV
+              else
+                az containerapp create -g "$PROD_RG" -n "$NAME" \
+                  --environment "$PROD_ENV_NAME" \
+                  --image "$IMAGE" \
+                  --ingress external --target-port "$PORT" --transport auto
+              fi
             fi
           }
 
           # 1) customer-service (8002)
-          upsert "$CUSTOMER_APP" 8002 "$IMG_CUSTOMER"
+          upsert "$CUSTOMER_APP" 8002 "$IMG_CUSTOMER" ""
           CUSTOMER_FQDN=$(az containerapp show -g "$PROD_RG" -n "$CUSTOMER_APP" --query "properties.configuration.ingress.fqdn" -o tsv)
 
           # 2) product-service (8003)
-          upsert "$PRODUCT_APP" 8003 "$IMG_PRODUCT"
+          upsert "$PRODUCT_APP" 8003 "$IMG_PRODUCT" ""
 
           # 3) order-service (8001) needs CUSTOMER_SERVICE_URL
-          upsert "$ORDER_APP" 8001 "$IMG_ORDER" "--env-vars CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
+          upsert "$ORDER_APP" 8001 "$IMG_ORDER" "CUSTOMER_SERVICE_URL=http://${CUSTOMER_FQDN}"
 
           # 4) frontend (80)
-          upsert "$FRONTEND_APP" 80 "$IMG_FRONTEND"
+          upsert "$FRONTEND_APP" 80 "$IMG_FRONTEND" ""
 
           FRONTEND_URL="http://$(az containerapp show -g "$PROD_RG" -n "$FRONTEND_APP" --query "properties.configuration.ingress.fqdn" -o tsv)"
           echo "frontend=${FRONTEND_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Smoke check
-        shell: bash
         run: |
           set -e
           sleep 20
