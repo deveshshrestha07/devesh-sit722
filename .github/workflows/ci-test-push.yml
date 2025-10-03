@@ -3,6 +3,7 @@ name: CI - Test, Build & Push to ACR (Stage 1)
 on:
   push:
     branches: [ "testing" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,7 +38,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Try service-specific requirements if present; otherwise install basics
       - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
@@ -59,11 +59,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Login to Azure using OIDC + your federated credential
+      # ✅ OIDC login with your three Azure secrets
       - name: Azure login
         uses: azure/login@v2
         with:
-          client-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -72,12 +72,9 @@ jobs:
 
       - name: Build images
         run: |
-          # Backend services
           docker build -f backend/customer_service/Dockerfile -t $ACR_LOGIN_SERVER/customer-service:${IMAGE_TAG} backend/customer_service
           docker build -f backend/order_service/Dockerfile    -t $ACR_LOGIN_SERVER/order-service:${IMAGE_TAG}    backend/order_service
           docker build -f backend/product_service/Dockerfile  -t $ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}  backend/product_service
-
-          # Frontend (optional—remove if you don't want to push it in Stage 1)
           docker build -f frontend/Dockerfile -t $ACR_LOGIN_SERVER/frontend:${IMAGE_TAG} frontend
 
       - name: Push images
@@ -87,7 +84,6 @@ jobs:
           docker push $ACR_LOGIN_SERVER/product-service:${IMAGE_TAG}
           docker push $ACR_LOGIN_SERVER/frontend:${IMAGE_TAG}
 
-      # (Optional) Upload a small artifact listing the image refs for downstream jobs
       - name: Publish image references
         run: |
           {
