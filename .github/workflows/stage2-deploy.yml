@@ -11,7 +11,8 @@ permissions:
 
 env:
   LOCATION: australiaeast
-  RG_PREFIX: sit722-staging
+  # Use the fixed RG you already granted Contributor on:
+  RG_FIXED: sit722-staging-fixed
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
 
@@ -21,9 +22,12 @@ concurrency:
 
 jobs:
   deploy-staging:
-    # only run if Stage 1 succeeded AND was for the 'testing' branch
+    # Only run if Stage 1 succeeded for 'testing' branch
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Azure login (OIDC)
@@ -43,33 +47,34 @@ jobs:
         id: vars
         run: |
           echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-          echo "RG=${{ env.RG_PREFIX }}-${{ github.run_id }}"       >> "$GITHUB_OUTPUT"
+          # Reuse the fixed RG and derive a unique env name
+          echo "RG=${{ env.RG_FIXED }}"                              >> "$GITHUB_OUTPUT"
           echo "ENV_NAME=aca-${{ github.run_id }}"                   >> "$GITHUB_OUTPUT"
 
-      - name: Create resource group
-        run: |
-          az group create -n "${{ steps.vars.outputs.RG }}" -l "${{ env.LOCATION }}"
+      # NOTE: no az group create here (we're using existing RG)
 
       - name: Ensure providers registered
         run: |
           az provider register --namespace Microsoft.App --wait
           az provider register --namespace Microsoft.OperationalInsights --wait
 
-      - name: Create Log Analytics workspace
+      - name: Ensure Log Analytics workspace (create if missing)
         id: la
         run: |
           set -e
           LA_NAME="la-${{ github.run_id }}"
-          az monitor log-analytics workspace create \
-            -g "${{ steps.vars.outputs.RG }}" \
-            -n "$LA_NAME" \
-            -l "${{ env.LOCATION }}" >/dev/null
+          # Try to show first; if missing, create
+          if ! az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" >/dev/null 2>&1; then
+            az monitor log-analytics workspace create \
+              -g "${{ steps.vars.outputs.RG }}" \
+              -n "$LA_NAME" \
+              -l "${{ env.LOCATION }}" >/dev/null
+          fi
           LA_ID=$(az monitor log-analytics workspace show -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query id -o tsv)
           LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "${{ steps.vars.outputs.RG }}" -n "$LA_NAME" --query primarySharedKey -o tsv)
           echo "id=$LA_ID"  >> "$GITHUB_OUTPUT"
           echo "key=$LA_KEY" >> "$GITHUB_OUTPUT"
 
-      # ✅ no --assign-identity here
       - name: Create Container Apps environment
         run: |
           az containerapp env create \
@@ -79,7 +84,6 @@ jobs:
             --logs-workspace-id  "${{ steps.la.outputs.id }}" \
             --logs-workspace-key "${{ steps.la.outputs.key }}"
 
-      # ✅ assign identity in a separate step
       - name: Assign system identity to env
         run: |
           az containerapp env identity assign \
@@ -157,7 +161,7 @@ jobs:
           curl -fsS "${{ steps.deploy.outputs.PRODUCT_URL }}/health"  || true
           curl -fsS "${{ steps.deploy.outputs.ORDER_URL }}/health"    || true
 
-      - name: Save RG/env for teardown
+      - name: Save env info artifact
         run: |
           echo "${{ steps.vars.outputs.RG }}"       > staging-rg.txt
           echo "${{ steps.vars.outputs.ENV_NAME }}" > staging-env.txt
