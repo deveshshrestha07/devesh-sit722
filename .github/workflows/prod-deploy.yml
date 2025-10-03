@@ -2,8 +2,8 @@ name: Stage 3 - Deploy to Production (upsert)
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
+    branches: ["main"]      # auto-deploy on merge to main
+  workflow_dispatch:        # allow manual runs
 
 permissions:
   contents: read
@@ -12,16 +12,8 @@ permissions:
 env:
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-
-  # Prod infra (already created once)
-  PROD_RG: ${{ secrets.PROD_RG }}
-  PROD_ENV_NAME: ${{ secrets.PROD_ENV_NAME }}
-
-  # App names (override via repo secrets if you use different names in prod)
-  CUSTOMER_APP: ${{ secrets.PROD_CUSTOMER_APP || 'customer-service' }}
-  PRODUCT_APP:  ${{ secrets.PROD_PRODUCT_APP  || 'product-service'  }}
-  ORDER_APP:    ${{ secrets.PROD_ORDER_APP    || 'order-service'    }}
-  FRONTEND_APP: ${{ secrets.PROD_FRONTEND_APP || 'frontend'         }}
+  PROD_RG: ${{ secrets.PROD_RG }}             # e.g. sit722-staging-18219577214
+  PROD_ENV_NAME: ${{ secrets.PROD_ENV_NAME }} # e.g. aca-18219577214
 
 jobs:
   deploy:
@@ -37,42 +29,70 @@ jobs:
       - name: Install Container Apps extension
         run: az extension add --name containerapp --upgrade -y
 
-      - name: Normalize prod inputs (trim whitespace)
+      # Normalize inputs & compute defaults safely (no "||" in expressions)
+      - name: Normalize inputs & defaults
         id: norm
+        shell: bash
         run: |
+          # trim whitespace that often sneaks into secrets
           RG_TRIM=$(printf "%s" "$PROD_RG" | tr -d '[:space:]')
           ENV_TRIM=$(printf "%s" "$PROD_ENV_NAME" | tr -d '[:space:]')
-          echo "PROD_RG=$RG_TRIM" >> "$GITHUB_ENV"
-          echo "PROD_ENV_NAME=$ENV_TRIM" >> "$GITHUB_ENV"
-          echo "Using PROD_RG='$RG_TRIM' PROD_ENV_NAME='$ENV_TRIM'"
+          ACR_SRV_TRIM=$(printf "%s" "$ACR_LOGIN_SERVER" | sed -E 's#^https?://##')
+
+          # allow optional overrides via secrets; fallback to sane defaults
+          CUSTOMER_APP="${{ secrets.PROD_CUSTOMER_APP }}"
+          PRODUCT_APP="${{ secrets.PROD_PRODUCT_APP }}"
+          ORDER_APP="${{ secrets.PROD_ORDER_APP }}"
+          FRONTEND_APP="${{ secrets.PROD_FRONTEND_APP }}"
+          : "${CUSTOMER_APP:=customer-service}"
+          : "${PRODUCT_APP:=product-service}"
+          : "${ORDER_APP:=order-service}"
+          : "${FRONTEND_APP:=frontend}"
+
+          # commit to environment for subsequent steps
+          {
+            echo "PROD_RG=$RG_TRIM"
+            echo "PROD_ENV_NAME=$ENV_TRIM"
+            echo "ACR_LOGIN_SERVER=$ACR_SRV_TRIM"
+            echo "CUSTOMER_APP=$CUSTOMER_APP"
+            echo "PRODUCT_APP=$PRODUCT_APP"
+            echo "ORDER_APP=$ORDER_APP"
+            echo "FRONTEND_APP=$FRONTEND_APP"
+          } >> "$GITHUB_ENV"
+
+          echo "Using RG='$RG_TRIM' ENV='$ENV_TRIM' ACR='$ACR_SRV_TRIM'"
+          echo "Apps: $CUSTOMER_APP, $PRODUCT_APP, $ORDER_APP, $FRONTEND_APP"
 
       - name: Verify Container Apps environment exists
+        shell: bash
         run: |
           set -e
-          az containerapp env list -g "$PROD_RG" -o table || true
           if ! az containerapp env show -g "$PROD_RG" -n "$PROD_ENV_NAME" >/dev/null 2>&1; then
             echo "::error::Container Apps environment '$PROD_ENV_NAME' not found in RG '$PROD_RG'."
-            echo "Create it once (Portal/CLI) or fix the secret values."
+            echo "Create it once (Portal/CLI) or fix the PROD_RG/PROD_ENV_NAME secrets."
             exit 1
           fi
 
-      - name: Compute image tag
+      # Use :latest to avoid MANIFEST_UNKNOWN when main’s SHA was never pushed
+      - name: Compute image tag (use latest)
         id: vars
-        run: echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+        run: echo "IMAGE_TAG=latest" >> "$GITHUB_OUTPUT"
 
       - name: Ensure env can pull from ACR (idempotent)
+        shell: bash
         run: |
           set -e
           ENV_MI_PRINCIPAL_ID=$(az containerapp env show -g "$PROD_RG" -n "$PROD_ENV_NAME" --query identity.principalId -o tsv || true)
           if [ -n "$ENV_MI_PRINCIPAL_ID" ]; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+            # grant AcrPull if not already present
             az role assignment create \
               --assignee-object-id "$ENV_MI_PRINCIPAL_ID" \
               --assignee-principal-type ServicePrincipal \
               --role AcrPull \
               --scope "$ACR_ID" >/dev/null 2>&1 || true
 
-            # Newer CLI supports registry on the env; noop if already set
+            # some CLI revs support setting registry on env; swallow if unsupported
             az containerapp registry set \
               -g "$PROD_RG" \
               --environment "$PROD_ENV_NAME" \
@@ -84,6 +104,7 @@ jobs:
         id: upsert
         env:
           IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+        shell: bash
         run: |
           set -e
           IMG_CUSTOMER="${ACR_LOGIN_SERVER}/customer-service:${IMAGE_TAG}"
@@ -121,6 +142,7 @@ jobs:
           echo "frontend=${FRONTEND_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Smoke check
+        shell: bash
         run: |
           set -e
           sleep 20
